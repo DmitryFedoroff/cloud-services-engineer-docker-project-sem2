@@ -7,30 +7,96 @@ on:
 
 jobs:
   build_and_push_to_docker_hub:
-      name: Push Docker image to DockerHub
-      runs-on: ubuntu-latest
-      steps:
-        - name: Check out the repo
-          uses: actions/checkout@v3
-        - name: Set up Docker Buildx
-          uses: docker/setup-buildx-action@v2
-        - name: Login to Docker 
-          uses: docker/login-action@v2
-          with:
-            username: ${{ secrets.DOCKER_USER }}
-            password: ${{ secrets.DOCKER_PASSWORD }}
-        - name: Push Backend to DockerHub
-          uses: docker/build-push-action@v4
-          with:
-            context: ./backend/
-            push: true
-            tags: ${{ secrets.DOCKER_USER }}/docker-project-backend:latest
-        - name: Push Frontend to DockerHub
-          uses: docker/build-push-action@v4
-          with:
-            context: ./frontend/
-            push: true
-            tags: ${{ secrets.DOCKER_USER }}/docker-project-frontend:latest
+    name: Push Docker image to DockerHub
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Login to Docker
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_USER }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Push Backend to DockerHub
+        uses: docker/build-push-action@v4
+        with:
+          context: ./backend/
+          push: true
+          tags: ${{ secrets.DOCKER_USER }}/docker-project-backend:latest
+
+      - name: Push Frontend to DockerHub
+        uses: docker/build-push-action@v4
+        with:
+          context: ./frontend/
+          push: true
+          tags: ${{ secrets.DOCKER_USER }}/docker-project-frontend:latest
+          build-args: |
+            NPM_TOKEN=${{ secrets.NPM_TOKEN }}
+
+  trivy_scan:
+    name: Trivy scan
+    runs-on: ubuntu-latest
+    needs: [build_and_push_to_docker_hub]
+    steps:
+      - name: Trivy scan backend
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ secrets.DOCKER_USER }}/docker-project-backend:latest"
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: "os,library"
+          severity: "CRITICAL,HIGH"
+
+      - name: Trivy scan frontend
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ secrets.DOCKER_USER }}/docker-project-frontend:latest"
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: "os,library"
+          severity: "CRITICAL,HIGH"
+
+  security_checks:
+    name: Generate SBOM & Config Scan
+    runs-on: ubuntu-latest
+    needs: [trivy_scan]
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v3
+
+      - name: Syft SBOM (backend)
+        uses: anchore/sbom-action@v0.16.0
+        with:
+          image: ${{ secrets.DOCKER_USER }}/docker-project-backend:latest
+          output-file: sbom-backend.spdx.json
+
+      - name: Syft SBOM (frontend)
+        uses: anchore/sbom-action@v0.16.0
+        with:
+          image: ${{ secrets.DOCKER_USER }}/docker-project-frontend:latest
+          output-file: sbom-frontend.spdx.json
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sboms
+          path: |
+            sbom-backend.spdx.json
+            sbom-frontend.spdx.json
+
+      - name: Trivy config scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: config
+          hide-progress: true
+          exit-code: "1"
 
   run-with-docker-compose:
     name: Push Docker image to DockerHub
@@ -42,3 +108,119 @@ jobs:
         uses: docker/setup-buildx-action@v2
       - name: Build via Docker Compose
         uses: hoverkraft-tech/compose-action@v2.2.0
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  test_compose_with_secrets:
+    name: Test Docker Compose with Secrets
+    runs-on: ubuntu-latest
+    needs: [build_and_push_to_docker_hub]
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      - name: Build services
+        run: |
+          export DOCKER_BUILDKIT=1
+          export COMPOSE_DOCKER_CLI_BUILD=1
+          export NPM_TOKEN="${{ secrets.NPM_TOKEN }}"
+          docker compose --profile dev build
+      - name: Run services
+        run: docker compose --profile dev up -d
+      - name: Wait for services
+        run: sleep 15
+      - name: Test backend health
+        run: curl -f http://localhost:8081/health
+      - name: Test frontend health
+        run: curl -f http://localhost/momo-store/
+      - name: Test volumes created
+        run: docker volume ls | grep -E "backend-data|backend-logs|frontend-logs"
+      - name: Cleanup
+        if: always()
+        run: docker compose --profile dev down -v
+
+  deploy_prod_stack:
+    name: Deploy prod profile via Compose
+    runs-on: ubuntu-latest
+    needs: [security_checks]
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v3
+
+      - name: Login to Docker
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_USER }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Compose up (prod)
+        run: |
+          export DOCKER_BUILDKIT=1
+          export COMPOSE_DOCKER_CLI_BUILD=1
+          export NPM_TOKEN="${{ secrets.NPM_TOKEN }}"
+          docker compose --profile prod up --build -d
+
+      - name: Wait and check services
+        run: |
+          sleep 20
+          docker ps
+          docker compose --profile prod ps
+
+      - name: Test services health
+        run: |
+          curl -f http://localhost:8081/health
+          curl -f http://localhost/momo-store/
+          curl -f http://localhost:8080/health
+
+      - name: Test volumes and security
+        run: |
+          docker volume ls | grep -E "backend-data|backend-logs|frontend-logs|lb-logs"
+          docker exec cloud-services-engineer-docker-project-sem2-backend-1 id | grep -E "uid=10001"
+          docker exec momo-store-frontend id | grep -E "uid=101"
+          docker inspect cloud-services-engineer-docker-project-sem2-backend-1 --format='{{.HostConfig.ReadonlyRootfs}}' | grep true
+      - name: Cleanup
+        if: always()
+        run: docker compose --profile prod down -v
+
+  hadolint_lint:
+    name: Lint Dockerfiles with Hadolint
+    runs-on: ubuntu-latest
+    needs: [build_and_push_to_docker_hub]
+    strategy:
+      matrix:
+        dockerfile:
+          - backend/Dockerfile
+          - frontend/Dockerfile
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v3
+      - name: Run Hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: ${{ matrix.dockerfile }}
+
+  dockle_scan:
+    name: Container CIS benchmark (Dockle)
+    runs-on: ubuntu-latest
+    needs: [build_and_push_to_docker_hub]
+    steps:
+      - name: Run Dockle for backend
+        uses: goodwithtech/dockle-action@main
+        with:
+          image: "${{ secrets.DOCKER_USER }}/docker-project-backend:latest"
+          format: list
+          exit-code: "1"
+          exit-level: fatal
+          accept-key: "org.opencontainers.image.authors,org.opencontainers.image.description,org.opencontainers.image.version,org.opencontainers.image.source"
+          ignore: "DKL-DI-0006" # разрешаем тег :latest
+
+      - name: Run Dockle for frontend
+        uses: goodwithtech/dockle-action@main
+        with:
+          image: "${{ secrets.DOCKER_USER }}/docker-project-frontend:latest"
+          format: list
+          exit-code: "1"
+          exit-level: fatal
+          accept-key: "org.opencontainers.image.authors,org.opencontainers.image.description,org.opencontainers.image.version,org.opencontainers.image.source,apkArch,maintainer,NGINX_VERSION,PKG_RELEASE,DYNPKG_RELEASE,NJS_VERSION,NJS_RELEASE,nginxPackages,KEY_SHA512,tempDir"
+          ignore: "DKL-DI-0006" # разрешаем тег :latest
